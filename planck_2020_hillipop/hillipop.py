@@ -111,7 +111,7 @@ class _HillipopLikelihood(InstallableLikelihood):
                 f"Check the given path [{self.covariance_matrix_file}]",
             )
         self._invkll = self._read_invcovmatrix(filename)
-        self._invkll = self._invkll.astype('float32')
+        #self._invkll = self._invkll.astype('float32')
 
         # Foregrounds
         self.fgs = {}  # list of foregrounds per mode [TT,EE,TE,ET]
@@ -242,7 +242,7 @@ class _HillipopLikelihood(InstallableLikelihood):
 
         data = fits.getdata(filename)
         nel = int(np.sqrt(data.size))
-        data = data.reshape((nel, nel)) / 1e24  # muK^-4
+        data = data.reshape((nel, nel)) #/ 1e24  # muK^-4
 
         nell = self._get_matrix_size()
         if nel != nell:
