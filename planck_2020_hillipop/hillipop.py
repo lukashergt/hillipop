@@ -8,6 +8,7 @@ import os
 import re
 from itertools import combinations
 from typing import Optional
+from copy import deepcopy
 
 import astropy.io.fits as fits
 import numpy as np
@@ -32,6 +33,12 @@ fg_list = {
     "tsz": fg.tsz_model,
     "szxcib": fg.szxcib_model,
 }
+
+# binning for Hillipop lite likelihoods
+lower_l = np.arange(30, 251, 1)     # unbinned
+upper_l = np.arange(251, 2501, 10)  # binned
+lite_lmins = np.concatenate((lower_l, upper_l))
+lite_lmaxs = np.concatenate((lower_l, upper_l + 9))
 
 
 # ------------------------------------------------------------------------------------------------
@@ -81,7 +88,7 @@ class _HillipopLikelihood(InstallableLikelihood):
 
         # Get likelihood name and add the associated mode
         likelihood_name = self.__class__.__name__
-        likelihood_modes = [likelihood_name[i : i + 2] for i in range(0, len(likelihood_name), 2)]
+        likelihood_modes = [likelihood_name[i:i+2] for i in range(0, len(likelihood_name), 2)]
         self._is_mode = {mode: mode in likelihood_modes for mode in ["TT", "TE", "EE", "BB"]}
         self._is_mode["ET"] = self._is_mode["TE"]
         self.log.debug(f"mode = {self._is_mode}")
@@ -90,6 +97,13 @@ class _HillipopLikelihood(InstallableLikelihood):
         filename = os.path.join(self.data_folder, self.multipoles_range_file)
         self._lmins, self._lmaxs = self._set_multipole_ranges(filename)
         self.lmax = np.max([max(l) for l in self._lmaxs.values()])
+
+        # Binning (optional)
+        self.is_lite = 'lite' in self.__class__.__name__
+        if self.is_lite:
+            self.wf = tools.Bins(lite_lmins, lite_lmaxs)
+        else:
+            self.wf = tools.Bins.fromdeltal(2, self.lmax+1, 1)
 
         # Data
         basename = os.path.join(self.data_folder, self.xspectra_basename)
@@ -104,8 +118,13 @@ class _HillipopLikelihood(InstallableLikelihood):
         # Inverted Covariance matrix
         filename = os.path.join(self.data_folder, self.covariance_matrix_file)
         # Sanity check
-        m = re.search(".*_(.+?).fits", self.covariance_matrix_file)
-        if not m or likelihood_name != m.group(1):
+        # `covariance_matrix_file` example: invfll_PR4_v4.2_TTTEEE_lite.fits
+        if self.is_lite:
+            _, lname, lite = self.covariance_matrix_file.rsplit('.', maxsplit=1)[0].rsplit('_', maxsplit=2)
+            lname += '_' + lite
+        else:
+            _, lname = self.covariance_matrix_file.rsplit('.', maxsplit=1)[0].rsplit('_', maxsplit=1)
+        if not lname or likelihood_name != lname:
             raise LoggedError(
                 self.log,
                 "The covariance matrix mode differs from the likelihood mode. "
@@ -261,8 +280,12 @@ class _HillipopLikelihood(InstallableLikelihood):
         # TT,EE,TEET
         for m in ["TT", "EE", "TE"]:
             if self._is_mode[m]:
-                nells = self._lmaxs[m] - self._lmins[m] + 1
-                nell += np.sum([nells[self._xspec2xfreq.index(k)] for k in range(self._nxfreq)])
+                for xf in range(self._nxfreq):
+                    lmin = self._lmins[m][self._xspec2xfreq.index(xf)]
+                    lmax = self._lmaxs[m][self._xspec2xfreq.index(xf)]
+                    wf = deepcopy(self.wf)
+                    wf.cut_binning(lmin, lmax)
+                    nell += wf.nbins
 
         return nell
 
@@ -276,7 +299,9 @@ class _HillipopLikelihood(InstallableLikelihood):
         for xf in range(self._nxfreq):
             lmin = self._lmins[mode][self._xspec2xfreq.index(xf)]
             lmax = self._lmaxs[mode][self._xspec2xfreq.index(xf)]
-            xl += list(acl[xf, lmin : lmax + 1])
+            wf = deepcopy(self.wf)
+            wf.cut_binning(lmin, lmax)
+            xl += list(wf.bin_spectra(acl[xf]))
         return xl
 
     def _xspectra_to_xfreq(self, cl, weight, normed=True):
@@ -406,6 +431,11 @@ class _HillipopLikelihood(InstallableLikelihood):
         chi2 = self._invkll.dot(self.delta_cl).dot(self.delta_cl)
 
         self.log.debug(f"chi2/ndof = {chi2}/{len(self.delta_cl)}")
+
+        #protect against cast float32
+        alpha = 8. - np.ceil(np.log10(chi2))
+        chi2 = np.float64(np.round(chi2*10**alpha))*10**(-alpha)
+        
         return chi2
 
     def get_requirements(self):
@@ -510,3 +540,26 @@ class TE(_HillipopLikelihood):
     """
 
     install_options = _get_install_options("planck_2020_hillipop_TE_v4.2.tar.gz")
+
+
+class TT_lite(_HillipopLikelihood):
+    """High-L TT Likelihood for Polarized Planck spectra-based Gaussian-approximated likelihood with
+    foreground models for cross-correlation spectra from Planck 100, 143 and 217 GHz split-frequency
+    maps.
+    Binned version.
+
+    """
+
+    install_options = _get_install_options("planck_2020_hillipop_TT_lite_v4.2.tar.gz")
+
+
+class TTTEEE_lite(_HillipopLikelihood):
+    """High-L TT+TE+EE Likelihood for Polarized Planck Spectra-based Gaussian-approximated likelihood
+    with foreground models for cross-correlation spectra from Planck 100, 143 and 217 GHz
+    split-frequency maps.
+    Binned version.
+
+    """
+
+    install_options = _get_install_options("planck_2020_hillipop_TTTEEE_lite_v4.2.tar.gz")
+
