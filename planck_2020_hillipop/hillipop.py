@@ -15,6 +15,7 @@ import numpy as np
 from cobaya.conventions import data_path, packages_path_input
 from cobaya.likelihoods.base_classes import InstallableLikelihood
 from cobaya.log import LoggedError
+from cobaya.mpi import is_main_process
 
 from . import foregrounds as fg
 from . import tools
@@ -54,6 +55,7 @@ class _HillipopLikelihood(InstallableLikelihood):
     xspectra_basename: Optional[str]
     covariance_matrix_file: Optional[str]
     foregrounds: Optional[list]
+    ell_cuts: Optional[dict] = None  # e.g. {TT: [30, 1000], TE: [30, 600], EE: [30, 600]}
 
     def initialize(self):
         # Set path to data
@@ -84,6 +86,7 @@ class _HillipopLikelihood(InstallableLikelihood):
         self._nxfreq = self._nfreq * (self._nfreq + 1) // 2
         self._nxspec = self._nmap * (self._nmap - 1) // 2
         self._xspec2xfreq = self._xspec2xfreq()
+        self._xfreq_labels = self._xfreq_labels()
         self.log.debug(f"frequencies = {self.frequencies}")
 
         # Get likelihood name and add the associated mode
@@ -131,7 +134,8 @@ class _HillipopLikelihood(InstallableLikelihood):
                 f"Check the given path [{self.covariance_matrix_file}]",
             )
         self._invkll = self._read_invcovmatrix(filename)
-        self._invkll = self._invkll.astype('float32')
+        if not self.is_lite:
+            self._invkll = self._invkll.astype('float32')
 
         # Foregrounds
         self.fgs = {}  # list of foregrounds per mode [TT,EE,TE,ET]
@@ -181,6 +185,10 @@ class _HillipopLikelihood(InstallableLikelihood):
         self.fgs['TE'] = fgsTE
         self.fgs['ET'] = fgsET
 
+        # Optional ell cuts (e.g. for combining with ACT/SPT)
+        if self.ell_cuts is not None:
+            self._apply_ell_cuts()
+
         self.log.info("Initialized!")
 
     def _xspec2xfreq(self):
@@ -198,6 +206,14 @@ class _HillipopLikelihood(InstallableLikelihood):
                 spec2freq.append(list_fqs.index((f1, f2)))
 
         return spec2freq
+
+    def _xfreq_labels(self):
+        freqs = list(np.unique(self.frequencies))
+        labels = []
+        for f1 in range(self._nfreq):
+            for f2 in range(f1, self._nfreq):
+                labels.append(f"{freqs[f1]}x{freqs[f2]}")
+        return labels
 
     def _set_multipole_ranges(self, filename):
         """
@@ -224,6 +240,64 @@ class _HillipopLikelihood(InstallableLikelihood):
         lmaxs["ET"] = lmaxs["TE"]
 
         return lmins, lmaxs
+
+    def _apply_ell_cuts(self):
+        """Apply multipole cuts by removing rows/columns from the covariance
+        and re-inverting.
+
+        ell_cuts is a dict mapping mode to [lmin, lmax], e.g.
+        ``{TT: [30, 1000], TE: [30, 600], EE: [30, 600]}``.
+        Modes absent from the dict are left uncut.
+
+        Bins outside the specified range are removed entirely from the
+        covariance matrix (obtained by inverting the stored inverse
+        covariance), and the reduced matrix is re-inverted.  A boolean
+        mask (``self._ell_cuts_keep``) is stored so that ``compute_chi2``
+        can apply the same selection to the data vector.
+
+        The index ordering matches _get_matrix_size() and compute_chi2():
+        modes ["TT", "EE", "TE"], then within each mode over cross-frequencies.
+        """
+        keep = []
+        idx = 0
+
+        for mode in ["TT", "EE", "TE"]:
+            if not self._is_mode[mode]:
+                continue
+            mode_cuts = self.ell_cuts.get(mode)
+            for xf in range(self._nxfreq):
+                xf_idx = self._xspec2xfreq.index(xf)
+                lmin = self._lmins[mode][xf_idx]
+                lmax = self._lmaxs[mode][xf_idx]
+                wf = deepcopy(self.wf)
+                wf.cut_binning(lmin, lmax)
+                if mode_cuts is not None:
+                    mask = ((wf.lmins >= mode_cuts[0])
+                            & (wf.lmaxs <= mode_cuts[1]))
+                    keep.extend(idx + np.where(mask)[0])
+                    if not np.all(mask) and is_main_process():
+                        self.log.info(
+                            f"Cutting {mode} {self._xfreq_labels[xf]} data to the"
+                            f" range [{mode_cuts[0]}, {mode_cuts[1]}]."
+                            f" Keeping {mask.sum()}/{len(mask)} bins"
+                            f" (effective range"
+                            f" [{wf.lmins[mask].min()},"
+                            f" {wf.lmaxs[mask].max()}])."
+                        )
+                else:
+                    keep.extend(range(idx, idx + wf.nbins))
+                idx += wf.nbins
+
+        keep = np.array(keep, dtype=int)
+        n_orig = idx
+        n_kept = len(keep)
+
+        if n_kept < n_orig:
+            # Invert to covariance, select kept bins, re-invert
+            kll = np.linalg.inv(self._invkll)
+            kll = kll[np.ix_(keep, keep)]
+            self._invkll = np.linalg.inv(kll)
+            self._ell_cuts_keep = keep
 
     def _read_dl_xspectra(self, basename, hdu=1):
         """
@@ -263,6 +337,7 @@ class _HillipopLikelihood(InstallableLikelihood):
         data = fits.getdata(filename)
         nel = int(np.sqrt(data.size))
         data = data.reshape((nel, nel)) / 1e24  # muK^-4
+        data = 0.5 * (data + data.T)  # ensure exact symmetry
 
         nell = self._get_matrix_size()
         if nel != nell:
@@ -427,6 +502,8 @@ class _HillipopLikelihood(InstallableLikelihood):
             Xl += self._select_spectra(Rl / Wl, 'TE')
 
         self.delta_cl = np.asarray(Xl).astype('float32')
+        if hasattr(self, '_ell_cuts_keep'):
+            self.delta_cl = self.delta_cl[self._ell_cuts_keep]
 #        chi2 = self.delta_cl @ self._invkll @ self.delta_cl
         chi2 = self._invkll.dot(self.delta_cl).dot(self.delta_cl)
 
